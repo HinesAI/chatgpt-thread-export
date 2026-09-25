@@ -9,7 +9,7 @@ chrome.action.onClicked.addListener(async (tab) => {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => {
-          alert("Open a ChatGPT conversation on chatgpt.com, then click the extension again.");
+          alert("Open a ChatGPT conversation or share link on chatgpt.com, then click the extension again.");
         },
       });
     } catch (_err) {

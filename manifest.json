@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Thread Export",
-  "version": "1.0.0",
-  "description": "Scroll a full ChatGPT conversation, collect every message, and copy it for Word or other editors.",
+  "version": "1.1.0",
+  "description": "Export the open ChatGPT conversation or share link via the official conversation API (full thread, including first and last messages).",
   "permissions": ["activeTab", "scripting"],
   "host_permissions": [
     "https://chatgpt.com/*",

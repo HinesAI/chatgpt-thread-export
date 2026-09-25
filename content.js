@@ -6,8 +6,6 @@
   }
   window.__chatgptThreadExportRunning = true;
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
   const status = (msg) => {
     let el = document.getElementById("cgpt-export-status");
     if (!el) {
@@ -20,25 +18,193 @@
     el.textContent = msg;
   };
 
-  const isScrollable = (el) => {
-    if (!el) return false;
-    const st = getComputedStyle(el);
-    return /(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 40;
+  const idsFromUrl = () => {
+    const path = location.pathname;
+    const conv = path.match(/\/c\/([a-f0-9-]{36})/i);
+    if (conv) return { kind: "conversation", id: conv[1] };
+    const share = path.match(/\/share\/(?:e\/)?([a-zA-Z0-9_-]+)/i);
+    if (share) return { kind: "share", id: share[1] };
+    return null;
   };
 
-  const collectScrollers = () =>
-    [...document.querySelectorAll("div, main, section")]
-      .filter(isScrollable)
-      .sort((a, b) => b.scrollHeight - a.scrollHeight)
-      .slice(0, 8);
+  const getAccessToken = async () => {
+    try {
+      const res = await fetch("/api/auth/session", { credentials: "include" });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data?.accessToken || data?.access_token || null;
+    } catch (_e) {
+      return null;
+    }
+  };
 
-  const messageNodes = () =>
-    [...document.querySelectorAll("[data-message-author-role]")].filter((el) => {
-      const t = (el.innerText || "").trim();
-      return t.length > 0;
+  const fetchJson = async (url, token) => {
+    const headers = { Accept: "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(url, { credentials: "include", headers });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`${url} → ${res.status}: ${body.slice(0, 240)}`);
+    }
+    return res.json();
+  };
+
+  const loadConversation = async (ref, token) => {
+    if (ref.kind === "conversation") {
+      return fetchJson(`/backend-api/conversation/${ref.id}`, token);
+    }
+
+    const shareCandidates = [
+      `/backend-api/shared_conversations/${ref.id}`,
+      `/backend-api/share/${ref.id}`,
+      `/backend-api/conversation/share/${ref.id}`,
+    ];
+    let lastErr;
+    for (const url of shareCandidates) {
+      try {
+        const data = await fetchJson(url, token);
+        return data.mapping ? data : data.conversation || data;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+
+    const next = document.getElementById("__NEXT_DATA__");
+    if (next?.textContent) {
+      try {
+        const parsed = JSON.parse(next.textContent);
+        const stack = [parsed];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (cur && typeof cur === "object") {
+            if (cur.mapping && (cur.current_node || cur.title)) return cur;
+            for (const v of Object.values(cur)) stack.push(v);
+          }
+        }
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+
+    throw lastErr || new Error("Could not load share conversation JSON");
+  };
+
+  const partToText = (part) => {
+    if (part == null) return "";
+    if (typeof part === "string") return part;
+    if (typeof part === "object") {
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.value === "string") return part.value;
+      if (part.content_type === "image_asset_pointer") return "[image]";
+      if (Array.isArray(part.parts)) return part.parts.map(partToText).join("");
+      if (Array.isArray(part.content)) return part.content.map(partToText).join("\n");
+    }
+    return "";
+  };
+
+  const messageText = (msg) => {
+    if (!msg) return "";
+    const c = msg.content;
+    if (!c) return "";
+    if (typeof c === "string") return c.trim();
+    if (Array.isArray(c.parts)) return c.parts.map(partToText).join("\n").trim();
+    if (typeof c.text === "string") return c.text.trim();
+    if (Array.isArray(c)) return c.map(partToText).join("\n").trim();
+    return "";
+  };
+
+  const isHidden = (msg) => {
+    const md = msg?.metadata || {};
+    return Boolean(md.is_visually_hidden_from_conversation || md.is_user_system_message);
+  };
+
+  const linearizeFlat = (mapping) => {
+    const msgs = [];
+    for (const node of Object.values(mapping)) {
+      const msg = node?.message;
+      if (!msg) continue;
+      const role = msg.author?.role;
+      if (role !== "user" && role !== "assistant") continue;
+      if (isHidden(msg)) continue;
+      const text = messageText(msg);
+      if (!text) continue;
+      msgs.push({
+        role,
+        text,
+        create_time: msg.create_time ?? node.create_time ?? null,
+        id: msg.id || node.id,
+      });
+    }
+    msgs.sort((a, b) => {
+      const ta = a.create_time;
+      const tb = b.create_time;
+      if (ta == null && tb == null) return 0;
+      if (ta == null) return -1;
+      if (tb == null) return 1;
+      return ta - tb;
     });
+    const seen = new Set();
+    return msgs.filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    });
+  };
 
-  const showOverlay = (text, messageCount) => {
+  /** Active branch: current_node → parents → root, then reverse. */
+  const linearize = (data) => {
+    const mapping = data.mapping || {};
+    let startId = data.current_node;
+
+    if (!startId) {
+      const tip = Object.values(mapping).find(
+        (n) => n && n.message && (!n.children || n.children.length === 0)
+      );
+      startId = tip?.id;
+    }
+    if (!startId) return linearizeFlat(mapping);
+
+    const path = [];
+    const visited = new Set();
+    let nodeId = startId;
+    while (nodeId && !visited.has(nodeId)) {
+      visited.add(nodeId);
+      const node = mapping[nodeId];
+      if (!node) break;
+      path.push(node);
+      nodeId = node.parent;
+    }
+    path.reverse();
+
+    const msgs = [];
+    for (const node of path) {
+      const msg = node.message;
+      if (!msg) continue;
+      const role = msg.author?.role;
+      if (role !== "user" && role !== "assistant") continue;
+      if (isHidden(msg)) continue;
+      const text = messageText(msg);
+      if (!text) continue;
+      msgs.push({ role, text, id: msg.id || node.id });
+    }
+
+    if (msgs.length < 2) {
+      const flat = linearizeFlat(mapping);
+      if (flat.length > msgs.length) return flat;
+    }
+    return msgs;
+  };
+
+  const toText = (title, messages) => {
+    const blocks = [`# ${title || "ChatGPT conversation"}`, ""];
+    for (const m of messages) {
+      const who = m.role === "user" ? "You" : "ChatGPT";
+      blocks.push(`${who}:\n${m.text}`);
+    }
+    return blocks.join("\n\n----------------\n\n").trim();
+  };
+
+  const showOverlay = (text, messageCount, title) => {
     document.getElementById("cgpt-export-overlay")?.remove();
 
     const overlay = document.createElement("div");
@@ -54,8 +220,10 @@
     header.style.cssText =
       "display:flex;gap:10px;align-items:center;justify-content:space-between;padding:14px 16px;background:#111;color:#fff;font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;";
 
-    const title = document.createElement("div");
-    title.innerHTML = `<strong>ChatGPT Export ready</strong><div style="opacity:.8;font-size:12px;margin-top:2px">${messageCount} messages · ${text.length.toLocaleString()} characters</div>`;
+    const titleEl = document.createElement("div");
+    titleEl.innerHTML = `<strong>ChatGPT Export ready</strong><div style="opacity:.8;font-size:12px;margin-top:2px">${
+      title ? title.replace(/</g, "&lt;") + " · " : ""
+    }${messageCount} messages · ${text.length.toLocaleString()} characters</div>`;
 
     const actions = document.createElement("div");
     actions.style.cssText = "display:flex;gap:8px;";
@@ -96,7 +264,7 @@
     });
 
     actions.append(copyBtn, closeBtn);
-    header.append(title, actions);
+    header.append(titleEl, actions);
     panel.append(header, ta);
     overlay.append(panel);
     document.body.append(overlay);
@@ -106,91 +274,31 @@
 
   const run = async () => {
     try {
-      const scrollers = collectScrollers();
-      if (!scrollers.length) {
-        alert("No scroll area found. Click once inside the chat messages, then run the extension again.");
+      const ref = idsFromUrl();
+      if (!ref) {
+        alert(
+          "Open a ChatGPT conversation or share link first.\n\n" +
+            "https://chatgpt.com/c/...\nor\nhttps://chatgpt.com/share/..."
+        );
         return;
       }
 
-      const store = new Map();
-      const order = [];
+      status(`Loading ${ref.kind} via API…`);
+      const token = await getAccessToken();
+      const data = await loadConversation(ref, token);
+      status("Building transcript…");
 
-      const harvest = () => {
-        messageNodes().forEach((el) => {
-          const role = el.getAttribute("data-message-author-role") || "unknown";
-          const text = (el.innerText || "").trim();
-          if (!text) return;
-          const id =
-            el.getAttribute("data-message-id") ||
-            `${role}:${text.length}:${text.slice(0, 120)}`;
-          if (store.has(id)) return;
-          store.set(id, { role, text });
-          order.push(id);
-        });
-      };
-
-      const scrollTop = () => {
-        for (const s of scrollers) s.scrollTop = 0;
-        window.scrollTo(0, 0);
-      };
-
-      const scrollDown = () => {
-        for (const s of scrollers) {
-          const step = Math.max(400, Math.floor(s.clientHeight * 0.8));
-          s.scrollTop = Math.min(s.scrollTop + step, s.scrollHeight);
-        }
-      };
-
-      status("Loading oldest messages…");
-      let stable = 0;
-      let prev = -1;
-      for (let i = 0; i < 500; i++) {
-        scrollTop();
-        await sleep(280);
-        harvest();
-        status(`Loading oldest… ${store.size} messages`);
-        if (store.size === prev) stable += 1;
-        else stable = 0;
-        prev = store.size;
-        if (stable >= 12) break;
-      }
-
-      status("Sweeping full thread…");
-      stable = 0;
-      prev = store.size;
-      let prevTop = "";
-      for (let i = 0; i < 3000; i++) {
-        scrollDown();
-        await sleep(220);
-        harvest();
-        const sig = scrollers.map((s) => Math.round(s.scrollTop)).join("/");
-        status(`Sweeping… ${store.size} messages | scroll ${sig}`);
-        if (store.size === prev && sig === prevTop) stable += 1;
-        else stable = 0;
-        prev = store.size;
-        prevTop = sig;
-        if (stable >= 15) break;
-      }
-
-      harvest();
-
-      const text = order
-        .map((id) => {
-          const m = store.get(id);
-          const who =
-            m.role === "user" ? "You" : m.role === "assistant" ? "ChatGPT" : m.role;
-          return `${who}:\n${m.text}`;
-        })
-        .join("\n\n----------------\n\n")
-        .trim();
-
-      if (!text) {
-        alert("Captured 0 messages. Open a conversation and try again.");
+      const messages = linearize(data);
+      if (!messages.length) {
+        alert("Loaded the conversation, but found no user/assistant messages.");
+        console.log("[chatgpt-thread-export]", data);
         return;
       }
 
-      showOverlay(text, store.size);
-      status(`Done: ${store.size} messages ready`);
+      const title = data.title || "ChatGPT conversation";
+      const text = toText(title, messages);
+      showOverlay(text, messages.length, title);
+      status(`Done: ${messages.length} messages`);
     } catch (err) {
       console.error(err);
       alert(`Export failed: ${err && err.message ? err.message : err}`);
